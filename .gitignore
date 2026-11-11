@@ -1,0 +1,29 @@
+# Build output and external chess engine
+*.exe
+*.dll
+*.spec
+/build/
+/dist/
+/Stockfish-*/
+/stockfish/
+
+# Local environment, backups, history and secrets
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.backup*/
+.env
+.env.*
+!.env.example
+*.log
+*.npz
+moves.txt
+.DS_Store
+Thumbs.db
+
+# Local expanded dependency notices and old layout (kept for reference)
+/third_party/
+/tessdata/
+/hooks/
+/scripts/

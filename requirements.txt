@@ -1,0 +1,4 @@
+chess==1.11.2
+Pillow==13.0.0
+numpy==2.3.5
+tesserocr==2.12.0
