@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 from ctypes import wintypes
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import ImageChops, ImageGrab, ImageStat, ImageTk
@@ -15,8 +16,10 @@ from adaptive_themes import LIBRARY
 from board_overlay import BoardOverlay, displayed_moves, paint_arrows
 from live_analysis import LiveAnalysis
 from match_tracking import MatchWatcher
+from engine_setup import find_engine, remember_engine
 from move_list import matching_moves, read_token, recover_position
-from screen_ocr import scan_move_list
+from screen_ocr import scan_move_list, locate_move_list
+from screen_locator import locate_boards
 from standard_board import board_features, read_standard_pieces
 
 user32 = ctypes.windll.user32
@@ -25,6 +28,12 @@ user32.GetClientRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
 user32.ClientToScreen.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.POINT))
 user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
 user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+user32.WindowFromPoint.argtypes = (wintypes.POINT,)
+user32.WindowFromPoint.restype = wintypes.HWND
+user32.GetAncestor.argtypes = (wintypes.HWND,wintypes.UINT)
+user32.GetAncestor.restype = wintypes.HWND
+user32.IsWindow.argtypes = (wintypes.HWND,)
+user32.IsWindow.restype = wintypes.BOOL
 
 def chrome_client(window):
     title, kind = ctypes.create_unicode_buffer(512), ctypes.create_unicode_buffer(128)
@@ -39,6 +48,56 @@ def chrome_client(window):
 
 def grab(box):
     return ImageGrab.grab(bbox=box, all_screens=True).convert("RGB")
+
+
+def capture_desktop():
+    left,top = user32.GetSystemMetrics(76),user32.GetSystemMetrics(77)
+    width,height = user32.GetSystemMetrics(78),user32.GetSystemMetrics(79)
+    return grab((left,top,left+width,top+height)), (left,top)
+
+
+@dataclass(frozen=True)
+class ScreenMatch:
+    browser: int
+    client_size: tuple
+    region: tuple
+    moves_region: object
+
+
+def discover_screen():
+    image, origin = capture_desktop()
+    for candidate in locate_boards(image):
+        a,b,c,d = candidate.box
+        point = wintypes.POINT(origin[0]+(a+c)//2,origin[1]+(b+d)//2)
+        browser = user32.GetAncestor(user32.WindowFromPoint(point),2)
+        client = chrome_client(browser)
+        if not client:
+            continue
+        x,y,width,height = client
+        region = (a+origin[0]-x,b+origin[1]-y,c+origin[0]-x,d+origin[1]-y)
+        if not (0 <= region[0] < region[2] <= width and 0 <= region[1] < region[3] <= height):
+            continue
+        pieces = read_standard_pieces(image.crop(candidate.box),False)
+        if not pieces:
+            continue
+        probe = chess.Board(None)
+        probe.set_piece_map(pieces)
+        valid = False
+        for color in chess.COLORS:
+            probe.turn = color
+            valid = valid or probe.is_valid()
+        if not valid:
+            continue
+        clip = x-origin[0],y-origin[1],x+width-origin[0],y+height-origin[1]
+        try:
+            moves = locate_move_list(image,candidate.box,clip)
+        except (OSError,RuntimeError):
+            moves = None
+        if moves:
+            moves = tuple(value+(origin[index%2]-(x if index%2 == 0 else y))
+                          for index,value in enumerate(moves))
+        return ScreenMatch(browser,(width,height),region,moves)
+    return None
 
 def signature(board):
     return {square: piece.symbol() for square, piece in board.piece_map().items()}
@@ -204,6 +263,14 @@ class Trainer:
     def __init__(self, root, engine):
         self.root, self.engine = root, engine
         self.region = self.future = self.board = None
+        self.moves_region = None
+        self.auto_mode = False
+        self.auto_generation = 0
+        self.scan_executor = ThreadPoolExecutor(max_workers=1,thread_name_prefix='screen-search')
+        self.scan_future = None
+        self.next_scan = 0
+        self.mismatch_since = None
+        self.auto_color_pending = False
         self.analysis = LiveAnalysis(engine)
         self.reply = None
         self.analysis_error = ""
@@ -226,15 +293,16 @@ class Trainer:
         local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         self.history = MoveHistory(local / "ChessBotTrainer" / "moves.txt")
         self.player_black = tk.BooleanVar()
+        self.auto_color = tk.BooleanVar(value=True)
         self.orientation_mode = tk.StringVar(value="Авто")
         self.orientation = None
-        self.status = tk.StringVar(value="Выдели доску и ходы один раз. Новые матчи подхватятся автоматически.")
+        self.status = tk.StringVar(value="Открой шахматы в Chrome и нажми «Начать». Доску найду сам.")
         compact = root.winfo_screenheight() < 950
         self.board_size = 224 if compact else 288
-        self.move_heading = tk.StringVar(value="Выбери доску")
-        self.move_caption = tk.StringVar(value="Выдели доску и таблицу ходов в Chrome")
+        self.move_heading = tk.StringVar(value="Готов к поиску")
+        self.move_caption = tk.StringVar(value="Одна кнопка — доску и ходы найду на экране")
         self.phase = tk.StringVar(value="ГОТОВ К ЗАХВАТУ")
-        root.title("CHESSBOT 1.3 · автоматические матчи")
+        root.title("CHESSBOT 1.4 · автоматический экран")
         root.attributes("-topmost", True)
         root.configure(bg="#0d1411")
         root.resizable(False, False)
@@ -264,7 +332,7 @@ class Trainer:
         brand.pack(side="left")
         tk.Label(brand, text="CHESSBOT", font=("Segoe UI", 20, "bold"),
                  bg="#0d1411", fg="#f1f4eb").pack(anchor="w")
-        tk.Label(brand, text="Автоматические матчи · 1.3", font=("Segoe UI", 9),
+        tk.Label(brand, text="Автоматический экран · 1.4", font=("Segoe UI", 9),
                  bg="#0d1411", fg="#8b9e91").pack(anchor="w")
         tk.Button(header, text="Темы", command=self.show_themes,
                   font=("Segoe UI", 9), bg="#1a2720", fg="#abd28f",
@@ -326,6 +394,7 @@ class Trainer:
         orientation_choice.bind("<<ComboboxSelected>>", self.orientation_changed)
 
         for text, variable, command in (
+                ("Мой цвет автоматически", self.auto_color, self.auto_color_changed),
                 ("Стрелки прямо на доске", self.overlay_enabled, self.overlay_changed),
                 ("Показывать копию доски", self.preview_enabled, self.preview_changed)):
             tk.Checkbutton(settings, text=text, variable=variable, command=command,
@@ -336,14 +405,15 @@ class Trainer:
         tk.Label(settings, text="● Зелёная — твой ход   ● Голубая — ответ",
                  font=("Segoe UI", 8), bg="#142019", fg="#9fb2a4").pack(anchor="w", pady=(5, 0))
 
-        tk.Button(panel, text="◎   Выбрать доску и ходы", command=self.select,
+        self.start_button = tk.Button(panel, text="▶   Начать", command=self.toggle_auto,
                   bg="#c0ef86", fg="#182411", activebackground="#d4ffa6",
                   activeforeground="#182411", font=("Segoe UI", 11, "bold"),
-                  relief="flat", bd=0, pady=7 if compact else 9, cursor="hand2").pack(fill="x", pady=(8 if compact else 12, 8))
+                  relief="flat", bd=0, pady=7 if compact else 9, cursor="hand2")
+        self.start_button.pack(fill="x", pady=(8 if compact else 12, 8))
         actions = tk.Frame(panel, bg="#0d1411")
         actions.pack(fill="x")
         for column, (label, command) in enumerate((
-                ("История", self.show_history), ("Новая партия", lambda: self.select(restart=True)),
+                ("История", self.show_history), ("Найти заново", self.start_auto),
                 ("Сброс ходов", self.reset_history))):
             actions.columnconfigure(column, weight=1)
             tk.Button(actions, text=label, command=command, bg="#1a2720", fg="#c2d0c1",
@@ -358,6 +428,89 @@ class Trainer:
         self.overlay = BoardOverlay(root)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.timer = root.after(33, self.tick)
+
+    def auto_color_changed(self):
+        self.auto_color_pending = self.auto_color.get()
+        self.frame = None
+        self.clear_hints()
+
+    def toggle_auto(self):
+        if self.auto_mode:
+            self.auto_mode = False
+            self.auto_generation += 1
+            self.region = None
+            self.clear_hints()
+            self.start_button.configure(text='▶   Начать')
+            self.status.set('Остановлено. Нажми «Начать», чтобы снова найти доску.')
+        else:
+            self.start_auto()
+
+    def start_auto(self):
+        self.auto_mode = True
+        self.auto_generation += 1
+        self.capture_id += 1
+        self.region = None
+        self.next_scan = 0
+        self.mismatch_since = None
+        if self.board is None:
+            self.board = chess.Board()
+        self.auto_color_pending = self.auto_color.get()
+        self.prepare_capture()
+        self.start_button.configure(text='■   Остановить')
+        self.status.set('Ищу доску на экране…')
+        self.root.iconify()
+
+    def poll_auto(self):
+        if not self.auto_mode:
+            return
+        now = time.monotonic()
+        if self.scan_future is not None and self.scan_future.done():
+            job,self.scan_future = self.scan_future,None
+            try:
+                match = job.result()
+            except (OSError,RuntimeError,ValueError):
+                match = None
+            if match is not None and job.generation == self.auto_generation:
+                client = chrome_client(match.browser)
+                if client and client[2:] == match.client_size:
+                    changed = (self.region is None or self.browser != match.browser
+                               or max(abs(a-b) for a,b in zip(self.region,match.region)) > 3
+                               or self.client_size != match.client_size)
+                    if changed:
+                        first = self.region is None
+                        self.clear_hints()
+                        self.browser,self.client_size = match.browser,match.client_size
+                        self.region,self.moves_region = match.region,match.moves_region
+                        self.capture_id += 1
+                        if self.ocr_job:
+                            self.ocr_job.cancel()
+                            self.ocr_job = None
+                        self.prepare_capture()
+                        self.mismatch_since = None
+                        if first:
+                            self.auto_color_pending = self.auto_color.get()
+                    elif match.moves_region is not None and match.moves_region != self.moves_region:
+                        self.moves_region = match.moves_region
+                        self.capture_id += 1
+                        if self.ocr_job:
+                            self.ocr_job.cancel()
+                            self.ocr_job = None
+                        self.ocr_image = self.ocr_board_frame = self.visible_frame = None
+                        self.visible_count = 0
+                        self.next_ocr = 0
+            if job.generation == self.auto_generation:
+                self.next_scan = now+(2.5 if self.region else .5)
+        if self.scan_future is None and now >= self.next_scan:
+            self.overlay.before_capture()
+            self.scan_future = self.scan_executor.submit(discover_screen)
+            self.scan_future.generation = self.auto_generation
+            self.next_scan = now+(2.5 if self.region else .5)
+
+    def search_again(self):
+        self.clear_hints()
+        self.region = None
+        self.next_scan = 0
+        self.status.set('Ищу доску на экране…')
 
     def preview_changed(self):
         if self.preview_enabled.get():
@@ -440,6 +593,10 @@ class Trainer:
                     caption += f" · глубина {self.analysis_depth}"
             elif "Считаю" in text:
                 heading, caption, phase = "Считаю ход…", "Анализ текущей позиции", "ТВОЙ ХОД"
+            elif text.startswith('Ищу доску'):
+                heading, caption, phase = 'Ищу доску…', 'Открой видимую доску в Chrome. Области выбираются автоматически.', 'ПОИСК ПО ЭКРАНУ'
+            elif text.startswith('Остановлено'):
+                heading, caption, phase = 'Остановлено', 'Нажми «Начать», чтобы продолжить', 'ЗАХВАТ ВЫКЛЮЧЕН'
             elif text == "Партия завершена":
                 heading, caption, phase = "Партия окончена", "Ходы доступны в истории", "ГОТОВО"
             elif text.startswith("Пауза"):
@@ -447,12 +604,15 @@ class Trainer:
             elif self.region:
                 heading, caption, phase = "Сверяю доску", "Проверяю позицию перед подсказкой", "ЗАХВАТ АКТИВЕН"
             else:
-                heading, caption, phase = "Выбери доску", "Выдели доску и таблицу ходов в Chrome", "ГОТОВ К ЗАХВАТУ"
+                heading, caption, phase = "Готов к поиску", "Открой шахматы и нажми «Начать»", "ГОТОВ К ЗАХВАТУ"
             self.move_heading.set(heading)
             self.move_caption.set(caption)
             self.phase.set(phase)
 
-    def player_changed(self):
+    def player_changed(self, manual=True):
+        if manual:
+            self.auto_color.set(False)
+            self.auto_color_pending = False
         self.clear_hints()
         self.canvas.delete("hint")
 
@@ -461,7 +621,7 @@ class Trainer:
         self.frame = None
         self.pending = None
         self.needs_calibration = True
-        self.player_changed()
+        self.player_changed(manual=False)
 
     def prepare_capture(self):
         self.clear_hints()
@@ -493,6 +653,9 @@ class Trainer:
                 if shape.bit_count() >= 8*55
             }
         self.orientation = self.resolve_orientation(orientation_evidence)
+        if getattr(self,'auto_mode',False) and self.auto_color_pending and self.orientation is not None:
+            self.player_black.set(self.orientation)
+            self.auto_color_pending = False
         if self.orientation is None:
             return None
         self.pieces_frame = image
@@ -586,6 +749,8 @@ class Trainer:
             self.ocr_job = None
         self.board = candidate.board
         self.orientation = candidate.flipped
+        if getattr(self,'auto_mode',False) and self.auto_color.get():
+            self.player_black.set(candidate.flipped)
         self.history.start_ply = 0
         self.history.prefix = ""
         self.ocr_tokens = {}
@@ -622,6 +787,7 @@ class Trainer:
         if self.selection_timer is not None:
             self.root.after_cancel(self.selection_timer)
         self.ocr_executor.shutdown(wait=False, cancel_futures=True)
+        self.scan_executor.shutdown(wait=False,cancel_futures=True)
         self.analysis.close()
         self.overlay.close()
         try:
@@ -774,6 +940,8 @@ class Trainer:
         }
 
     def update_ocr(self, client):
+        if self.moves_region is None:
+            return
         if self.ocr_job and self.ocr_job.done():
             job, self.ocr_job = self.ocr_job, None
             try:
@@ -982,12 +1150,18 @@ class Trainer:
 
     def tick(self):
         try:
+            self.poll_auto()
             if not self.region:
                 self.overlay.hide()
+                if self.auto_mode:
+                    self.status.set('Ищу доску на экране… Открой видимую доску в Chrome.')
                 return
             if time.monotonic() < self.capture_retry_after:
                 return
             if user32.GetForegroundWindow() != self.browser:
+                if self.auto_mode and not user32.IsWindow(self.browser):
+                    self.search_again()
+                    return
                 self.pending = None
                 self.clear_hints()
                 self.canvas.delete("hint")
@@ -997,7 +1171,10 @@ class Trainer:
             if not client or client[2:] != self.client_size:
                 self.clear_hints()
                 self.canvas.delete("hint")
-                self.status.set("Верни прежний размер окна Chrome.")
+                if self.auto_mode:
+                    self.search_again()
+                else:
+                    self.status.set("Верни прежний размер окна Chrome.")
                 return
             x,y,_,_ = client
             left,top,right,bottom = self.region
@@ -1026,6 +1203,15 @@ class Trainer:
                 self.status.set("Распознаю новый матч…")
                 self.paint(image, False)
                 return
+            known = getattr(self,'frame_raw_pieces',None) is not None
+            if self.auto_mode and not known:
+                if self.mismatch_since is None:
+                    self.mismatch_since = time.monotonic()
+                elif time.monotonic()-self.mismatch_since > 1.1:
+                    self.search_again()
+                    return
+            else:
+                self.mismatch_since = None
             if self.orientation is None:
                 self.status.set("Выбери поворот доски в настройках")
                 self.paint(image, False)
@@ -1100,14 +1286,20 @@ def main():
     user32.SetProcessDPIAware()
     root = tk.Tk()
     root.withdraw()
-    path = filedialog.askopenfilename(title="Выбери файл Stockfish",filetypes=[("Stockfish","*.exe")])
+    path = find_engine()
+    if not path:
+        path = filedialog.askopenfilename(title="Первый запуск: выбери Stockfish",filetypes=[("Stockfish","*.exe")])
     if not path:
         root.destroy()
         return
     try:
-        engine = chess.engine.SimpleEngine.popen_uci([path],timeout=5,creationflags=0x08000000)
+        engine = chess.engine.SimpleEngine.popen_uci([str(path)],timeout=5,creationflags=0x08000000)
         options = {"Threads": max(1, min(4, (os.cpu_count() or 2)//2)), "Hash": 64}
         engine.configure({name: value for name, value in options.items() if name in engine.options})
+        try:
+            remember_engine(path)
+        except OSError:
+            pass
     except (OSError, chess.engine.EngineError) as error:
         messagebox.showerror("Stockfish",str(error))
         root.destroy()
