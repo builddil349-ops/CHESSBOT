@@ -12,6 +12,8 @@ import chess
 import chess.engine
 
 from adaptive_themes import LIBRARY
+from board_overlay import BoardOverlay, displayed_moves, paint_arrows
+from live_analysis import LiveAnalysis
 from move_list import matching_moves, read_token, recover_position
 from screen_ocr import scan_move_list
 from standard_board import board_features, read_standard_pieces
@@ -189,8 +191,16 @@ class MoveHistory:
 class Trainer:
     def __init__(self, root, engine):
         self.root, self.engine = root, engine
-        self.executor = ThreadPoolExecutor(max_workers=1)
         self.region = self.future = self.board = None
+        self.analysis = LiveAnalysis(engine)
+        self.reply = None
+        self.analysis_error = ""
+        self.analysis_depth = 0
+        self.overlay_enabled = tk.BooleanVar(value=True)
+        self.preview_enabled = tk.BooleanVar(value=False)
+        self.paint_image = None
+        self.paint_key = None
+        self.board_bounds = None
         self.ocr_tokens = {}
         self.ocr_executor = ThreadPoolExecutor(max_workers=1)
         self.ocr_job = None
@@ -209,7 +219,7 @@ class Trainer:
         self.move_heading = tk.StringVar(value="Выбери доску")
         self.move_caption = tk.StringVar(value="Выдели доску и таблицу ходов в Chrome")
         self.phase = tk.StringVar(value="ГОТОВ К ЗАХВАТУ")
-        root.title("CHESSBOT 1.1 · шахматы")
+        root.title("CHESSBOT 1.2 · на доске")
         root.attributes("-topmost", True)
         root.configure(bg="#0d1411")
         root.resizable(False, False)
@@ -239,7 +249,7 @@ class Trainer:
         brand.pack(side="left")
         tk.Label(brand, text="CHESSBOT", font=("Segoe UI", 20, "bold"),
                  bg="#0d1411", fg="#f1f4eb").pack(anchor="w")
-        tk.Label(brand, text="Игра с противником · 1.1", font=("Segoe UI", 9),
+        tk.Label(brand, text="Подсказки на доске · 1.2", font=("Segoe UI", 9),
                  bg="#0d1411", fg="#8b9e91").pack(anchor="w")
         tk.Button(header, text="Темы", command=self.show_themes,
                   font=("Segoe UI", 9), bg="#1a2720", fg="#abd28f",
@@ -262,6 +272,9 @@ class Trainer:
                                 bg="#17211b", highlightthickness=0)
         self.canvas.pack()
         self.draw_placeholder()
+        self.board_frame = board_frame
+        board_frame.pack_forget()
+        self.preview_anchor = hero
 
         status_row = tk.Frame(panel, bg="#0d1411")
         status_row.pack(fill="x", pady=(6, 7) if compact else (8, 11))
@@ -297,6 +310,17 @@ class Trainer:
         orientation_choice.pack(side="right")
         orientation_choice.bind("<<ComboboxSelected>>", self.orientation_changed)
 
+        for text, variable, command in (
+                ("Стрелки прямо на доске", self.overlay_enabled, self.overlay_changed),
+                ("Показывать копию доски", self.preview_enabled, self.preview_changed)):
+            tk.Checkbutton(settings, text=text, variable=variable, command=command,
+                           bg="#142019", fg="#c2d0c1", selectcolor="#24382b",
+                           activebackground="#142019", activeforeground="#efffdf",
+                           font=("Segoe UI", 9), bd=0, highlightthickness=0,
+                           anchor="w").pack(fill="x", pady=(5, 0))
+        tk.Label(settings, text="● Зелёная — твой ход   ● Голубая — ответ",
+                 font=("Segoe UI", 8), bg="#142019", fg="#9fb2a4").pack(anchor="w", pady=(5, 0))
+
         tk.Button(panel, text="◎   Выбрать доску и ходы", command=self.select,
                   bg="#c0ef86", fg="#182411", activebackground="#d4ffa6",
                   activeforeground="#182411", font=("Segoe UI", 11, "bold"),
@@ -316,8 +340,28 @@ class Trainer:
                  wraplength=310, justify="left", font=("Segoe UI", 9)).pack(
                      anchor="w", pady=(7, 0))
         self.status.trace_add("write", self.update_summary)
+        self.overlay = BoardOverlay(root)
         root.protocol("WM_DELETE_WINDOW", self.close)
-        self.timer = root.after(100, self.tick)
+        self.timer = root.after(33, self.tick)
+
+    def preview_changed(self):
+        if self.preview_enabled.get():
+            self.board_frame.pack(after=self.preview_anchor)
+        else:
+            self.board_frame.pack_forget()
+
+    def overlay_changed(self):
+        self.overlay.hide()
+
+    def clear_hints(self):
+        self.arrow = self.reply = None
+        self.last_requested = None
+        self.analysis_error = ""
+        self.analysis_depth = 0
+        self.analysis.cancel()
+        self.overlay.hide()
+        self.paint_key = None
+        self.canvas.delete("hint")
 
     def show_themes(self):
         LIBRARY.load()
@@ -364,14 +408,21 @@ class Trainer:
                 move = self.arrow
                 self.move_heading.set(f"{chess.square_name(move.from_square)}  →  {chess.square_name(move.to_square)}")
                 self.move_caption.set(hint_text(self.board, move).removeprefix("Подсказка: "))
+                if self.reply:
+                    position = self.board.copy(stack=False)
+                    position.push(move)
+                    if self.reply in position.legal_moves:
+                        self.move_caption.set(f"Ответ: {position.san(self.reply)} · по варианту движка")
             else:
                 self.move_heading.set(text.removeprefix("Подсказка: "))
                 self.move_caption.set("Рекомендация движка")
             self.status_dot.configure(fg="#c0ef86")
         else:
             self.status_dot.configure(fg="#8b9e91")
-            if text == "Жду ход противника":
-                heading, caption, phase = "Ход противника", "Подсказка появится на твоём ходу", "ПАРТИЯ ИДЁТ"
+            if text.startswith("Ход противника:"):
+                heading, caption, phase = text, "Ожидаемый ход по расчёту движка", "ХОД ПРОТИВНИКА"
+                if self.analysis_depth:
+                    caption += f" · глубина {self.analysis_depth}"
             elif "Считаю" in text:
                 heading, caption, phase = "Считаю ход…", "Анализ текущей позиции", "ТВОЙ ХОД"
             elif text == "Партия завершена":
@@ -387,8 +438,7 @@ class Trainer:
             self.phase.set(phase)
 
     def player_changed(self):
-        self.arrow = None
-        self.last_requested = None
+        self.clear_hints()
         self.canvas.delete("hint")
 
     def orientation_changed(self, _event=None):
@@ -399,6 +449,7 @@ class Trainer:
         self.player_changed()
 
     def prepare_capture(self):
+        self.clear_hints()
         self.orientation = None
         self.needs_calibration = True
         self.arrow = self.pending = self.last_requested = None
@@ -493,7 +544,8 @@ class Trainer:
         if self.selection_timer is not None:
             self.root.after_cancel(self.selection_timer)
         self.ocr_executor.shutdown(wait=False, cancel_futures=True)
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.analysis.close()
+        self.overlay.close()
         try:
             self.engine.quit()
         finally:
@@ -581,6 +633,8 @@ class Trainer:
                 self.ocr_tokens = {}
                 self.promotion.set("")
             self.prepare_capture()
+            # The taskbar button restores settings; hints remain on Chrome.
+            self.root.iconify()
 
         window.bind("<Escape>", cancel)
         canvas.bind("<Button-1>", press)
@@ -830,49 +884,49 @@ class Trainer:
         return single, baseline
 
     def paint(self, image, show_arrow):
+        pv = tuple(move for move in (self.arrow, self.reply) if move is not None)
+        arrows = displayed_moves(self.board, pv, not self.player_black.get()) if show_arrow else []
+        if self.overlay_enabled.get() and self.board_bounds and arrows:
+            self.overlay.show(self.board_bounds, arrows, self.orientation)
+        else:
+            self.overlay.hide()
+        key = (tuple(arrows), self.orientation)
+        if self.paint_image is image and self.paint_key == key:
+            return
+        self.paint_image, self.paint_key = image, key
         self.preview = ImageTk.PhotoImage(image.resize((self.board_size, self.board_size)))
         self.canvas.delete("all")
         self.canvas.create_image(0,0,anchor="nw",image=self.preview)
-        if self.arrow and show_arrow and self.arrow in self.board.legal_moves:
-            points = []
-            for square in (self.arrow.from_square, self.arrow.to_square):
-                x, y = chess.square_file(square), 7-chess.square_rank(square)
-                if self.orientation:
-                    x, y = 7-x, 7-y
-                cell = self.board_size/8
-                points.extend((cell*(x+.5), cell*(y+.5)))
-            self.canvas.create_line(*points, fill="#132a13", width=11, arrow=tk.LAST, arrowshape=(19,24,11), tags=("hint",))
-            self.canvas.create_line(*points, fill="#c4ff80", width=6, arrow=tk.LAST, arrowshape=(16,20,8), tags=("hint",))
+        paint_arrows(self.canvas, self.board_size, self.board_size, arrows,
+                     self.orientation, labels=False)
 
     def tick(self):
         try:
-            if self.future and self.future.done():
-                fen, job = self.future.position, self.future
-                self.future = None
-                result = job.result()
-                if (self.region and fen == self.board.fen()
-                        and job.capture_id == self.capture_id
-                        and job.player_color == (not self.player_black.get())
-                        and self.board.turn == job.player_color
-                        and result.move in self.board.legal_moves):
-                    self.arrow = result.move
             if not self.region:
+                self.overlay.hide()
                 return
             if user32.GetForegroundWindow() != self.browser:
                 self.pending = None
+                self.clear_hints()
                 self.canvas.delete("hint")
                 self.status.set("Пауза. Вернись в выбранное окно Chrome.")
                 return
             client = chrome_client(self.browser)
             if not client or client[2:] != self.client_size:
+                self.clear_hints()
+                self.canvas.delete("hint")
                 self.status.set("Верни прежний размер окна Chrome.")
                 return
             x,y,_,_ = client
             left,top,right,bottom = self.region
-            image = grab((x+left,y+top,x+right,y+bottom))
+            self.board_bounds = (x+left,y+top,x+right,y+bottom)
+            self.overlay.before_capture()
+            image = grab(self.board_bounds)
             if user32.GetForegroundWindow() != self.browser:
+                self.clear_hints()
                 return
             if self.frame is None or not same_board_frame(image,self.frame):
+                self.clear_hints()
                 self.frame = image
                 self.frame_match = None
                 self.frame_changed = time.monotonic()
@@ -881,7 +935,7 @@ class Trainer:
                 self.visible_count = 0
             image = self.frame
             self.update_ocr(client)
-            if time.monotonic()-self.frame_changed < .16:
+            if time.monotonic()-self.frame_changed < .08:
                 self.paint(image, False)
                 self.status.set("Дожидаюсь завершения хода…")
                 return
@@ -917,35 +971,44 @@ class Trainer:
                     self.board.push(move)
                     self.show_promotion(move)
                 self.save_history()
-                self.arrow = self.pending = None
-                self.frame = None
+                self.clear_hints()
+                self.pending = None
+                self.frame_match = (None, 0)
+                sequence = None
             else:
                 self.pending = sequence
-            fen = self.board.fen()
             if self.board.is_game_over():
                 status = "Партия завершена"
             elif sequence:
                 status = "Подтверждаю ход…"
             elif error > POSITION_TOLERANCE:
                 status = self.recovery_status()
-            elif self.board.turn != (not self.player_black.get()):
-                status = "Жду ход противника"
             else:
-                if self.future is None and fen != self.last_requested:
-                    self.last_requested = fen
-                    self.future = self.executor.submit(self.engine.play,self.board.copy(),chess.engine.Limit(time=.35))
-                    self.future.position = fen
-                    self.future.capture_id = self.capture_id
-                    self.future.player_color = not self.player_black.get()
-                status = hint_text(self.board, self.arrow) if self.arrow else "Считаю ход…"
+                self.analysis.request(self.board, not self.player_black.get(), self.capture_id)
+                result = self.analysis.poll()
+                if result:
+                    self.analysis_error = result.error
+                    if result.pv:
+                        self.arrow = result.pv[0]
+                        self.reply = result.pv[1] if len(result.pv) > 1 else None
+                        self.analysis_depth = result.depth
+                if self.analysis_error:
+                    status = "Движок: " + self.analysis_error
+                elif self.board.turn != (not self.player_black.get()):
+                    status = ("Ход противника: " + self.board.san(self.arrow)
+                              if self.arrow else "Считаю ответ противника…")
+                else:
+                    status = hint_text(self.board, self.arrow) if self.arrow else "Считаю ход…"
             self.status.set(status)
-            self.paint(image, not sequence and error <= POSITION_TOLERANCE)
+            self.paint(image, not sequence and error <= POSITION_TOLERANCE
+                       and not self.board.is_game_over() and not self.analysis_error)
         except (OSError, chess.engine.EngineError) as error:
             self.region = None
+            self.clear_hints()
             self.status.set(str(error))
         finally:
             if not self.closing:
-                self.timer = self.root.after(100, self.tick)
+                self.timer = self.root.after(33, self.tick)
 
 def main():
     user32.SetProcessDPIAware()
@@ -957,6 +1020,8 @@ def main():
         return
     try:
         engine = chess.engine.SimpleEngine.popen_uci([path],timeout=5,creationflags=0x08000000)
+        options = {"Threads": max(1, min(4, (os.cpu_count() or 2)//2)), "Hash": 64}
+        engine.configure({name: value for name, value in options.items() if name in engine.options})
     except (OSError, chess.engine.EngineError) as error:
         messagebox.showerror("Stockfish",str(error))
         root.destroy()
