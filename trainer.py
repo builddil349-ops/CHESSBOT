@@ -14,6 +14,7 @@ import chess.engine
 from adaptive_themes import LIBRARY
 from board_overlay import BoardOverlay, displayed_moves, paint_arrows
 from live_analysis import LiveAnalysis
+from match_tracking import MatchWatcher
 from move_list import matching_moves, read_token, recover_position
 from screen_ocr import scan_move_list
 from standard_board import board_features, read_standard_pieces
@@ -187,6 +188,17 @@ class MoveHistory:
         self.start_ply = ply
         self.prefix = ""
 
+    def archive(self):
+        text = self.read()
+        if not text.strip():
+            return None
+        directory = self.path.parent / "games"
+        directory.mkdir(parents=True, exist_ok=True)
+        name = time.strftime("%Y-%m-%d_%H-%M-%S") + f"-{time.time_ns()}.txt"
+        path = directory / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
 
 class Trainer:
     def __init__(self, root, engine):
@@ -205,6 +217,9 @@ class Trainer:
         self.ocr_executor = ThreadPoolExecutor(max_workers=1)
         self.ocr_job = None
         self.capture_id = 0
+        self.match_watcher = MatchWatcher()
+        self.capture_retry_after = 0
+        self.history_writable = True
         self.closing = False
         self.selection_timer = None
         self.promotion = tk.StringVar()
@@ -213,13 +228,13 @@ class Trainer:
         self.player_black = tk.BooleanVar()
         self.orientation_mode = tk.StringVar(value="Авто")
         self.orientation = None
-        self.status = tk.StringVar(value="До первого хода выдели доску и список ходов.")
+        self.status = tk.StringVar(value="Выдели доску и ходы один раз. Новые матчи подхватятся автоматически.")
         compact = root.winfo_screenheight() < 950
         self.board_size = 224 if compact else 288
         self.move_heading = tk.StringVar(value="Выбери доску")
         self.move_caption = tk.StringVar(value="Выдели доску и таблицу ходов в Chrome")
         self.phase = tk.StringVar(value="ГОТОВ К ЗАХВАТУ")
-        root.title("CHESSBOT 1.2 · на доске")
+        root.title("CHESSBOT 1.3 · автоматические матчи")
         root.attributes("-topmost", True)
         root.configure(bg="#0d1411")
         root.resizable(False, False)
@@ -249,7 +264,7 @@ class Trainer:
         brand.pack(side="left")
         tk.Label(brand, text="CHESSBOT", font=("Segoe UI", 20, "bold"),
                  bg="#0d1411", fg="#f1f4eb").pack(anchor="w")
-        tk.Label(brand, text="Подсказки на доске · 1.2", font=("Segoe UI", 9),
+        tk.Label(brand, text="Автоматические матчи · 1.3", font=("Segoe UI", 9),
                  bg="#0d1411", fg="#8b9e91").pack(anchor="w")
         tk.Button(header, text="Темы", command=self.show_themes,
                   font=("Segoe UI", 9), bg="#1a2720", fg="#abd28f",
@@ -462,10 +477,14 @@ class Trainer:
         self.visible_count = 0
         self.ocr_board_frame = None
 
+        self.match_watcher.reset()
+        self.capture_retry_after = 0
+
     def recognized_pieces(self, image):
         if self.pieces_frame is image:
             return self.frame_pieces
         raw = read_standard_pieces(image, False)
+        self.frame_raw_pieces = raw
         orientation_evidence = raw
         if raw is None:
             orientation_evidence = {
@@ -528,14 +547,73 @@ class Trainer:
                                parent=self.root):
             try:
                 self.history.reset(self.board.ply() if self.region else 0)
+                self.history_writable = True
             except OSError as error:
                 messagebox.showerror("История ходов", str(error), parent=self.root)
 
     def save_history(self):
+        if not self.history_writable:
+            return
         try:
             self.history.record(self.board)
         except OSError:
             self.promotion.set("Не удалось сохранить журнал ходов")
+
+    def archive_match(self):
+        try:
+            self.history.archive()
+            self.history_writable = True
+        except OSError:
+            # Keep capture running and preserve the old file if archival fails.
+            self.history_writable = False
+
+    def detect_new_match(self, image):
+        fresh = (self.visible_tokens if self.visible_frame is self.frame
+                 and self.visible_count >= 2 else None)
+        candidate, waiting = self.match_watcher.observe(
+            getattr(self, "frame_raw_pieces", None), self.board,
+            self.orientation_mode.get(), time.monotonic(), fresh)
+        if waiting:
+            self.clear_hints()
+            return True
+        if candidate is None:
+            return False
+        self.archive_match()
+        self.clear_hints()
+        self.capture_id += 1
+        if self.ocr_job is not None:
+            self.ocr_job.cancel()
+            self.ocr_job = None
+        self.board = candidate.board
+        self.orientation = candidate.flipped
+        self.history.start_ply = 0
+        self.history.prefix = ""
+        self.ocr_tokens = {}
+        # Seed only moves proven by the new board, never the preceding match.
+        position = self.board.root()
+        for move in self.board.move_stack:
+            self.ocr_tokens[position.ply()+1] = read_token(position.san(move))
+            position.push(move)
+        if not candidate.complete_history:
+            self.ocr_tokens = dict(fresh or {})
+        self.visible_tokens = {}
+        self.visible_frame = self.ocr_board_frame = self.ocr_image = None
+        self.visible_count = 0
+        self.next_ocr = 0
+        self.ocr_attempt = self.picture_attempt = None
+        self.pending = None
+        self.frame_pieces = self.board.piece_map()
+        self.pieces_frame = image
+        self.frame_match = (None, 0)
+        self.learn_templates(tile_signatures(image, self.orientation))
+        self.needs_calibration = False
+        self.match_watcher.reset()
+        self.save_history()
+        note = ("Новый матч распознан автоматически" if candidate.complete_history else
+                "Новый матч восстановлен по доске · права рокировки и взятия на проходе неизвестны")
+        self.promotion.set(note if self.history_writable else
+                           "Новый матч распознан · история недоступна, захват продолжается")
+        return False
 
 
     def close(self):
@@ -627,6 +705,8 @@ class Trainer:
             self.browser, self.client_size = browser, (width, height)
             self.region, self.moves_region = board_box, box
             if self.board is None or self.restart:
+                if self.board is not None:
+                    self.archive_match()
                 self.board = chess.Board()
                 self.history.start_ply = 0
                 self.history.prefix = ""
@@ -710,9 +790,9 @@ class Trainer:
                     self.visible_frame = self.frame
                     self.ocr_attempt = self.picture_attempt = None
         now = time.monotonic()
-        if self.ocr_job or now < self.next_ocr or now-self.frame_changed < .22:
+        if self.ocr_job or now < self.next_ocr or now-self.frame_changed < .10:
             return
-        self.next_ocr = now + .35
+        self.next_ocr = now + .15
         x, y, _, _ = client
         left, top, right, bottom = self.moves_region
         moves_image = grab((x+left, y+top, x+right, y+bottom))
@@ -905,6 +985,8 @@ class Trainer:
             if not self.region:
                 self.overlay.hide()
                 return
+            if time.monotonic() < self.capture_retry_after:
+                return
             if user32.GetForegroundWindow() != self.browser:
                 self.pending = None
                 self.clear_hints()
@@ -940,6 +1022,10 @@ class Trainer:
                 self.status.set("Дожидаюсь завершения хода…")
                 return
             self.recognized_pieces(image)
+            if self.detect_new_match(image):
+                self.status.set("Распознаю новый матч…")
+                self.paint(image, False)
+                return
             if self.orientation is None:
                 self.status.set("Выбери поворот доски в настройках")
                 self.paint(image, False)
@@ -1003,9 +1089,9 @@ class Trainer:
             self.paint(image, not sequence and error <= POSITION_TOLERANCE
                        and not self.board.is_game_over() and not self.analysis_error)
         except (OSError, chess.engine.EngineError) as error:
-            self.region = None
             self.clear_hints()
-            self.status.set(str(error))
+            self.capture_retry_after = time.monotonic()+.5
+            self.status.set("Повторяю захват… " + str(error))
         finally:
             if not self.closing:
                 self.timer = self.root.after(33, self.tick)
