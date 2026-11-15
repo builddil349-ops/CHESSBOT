@@ -82,6 +82,18 @@ class EngineSetupTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == 'win32','Windows capture integration')
 class AutoWorkflowTests(unittest.TestCase):
+    def test_ocr_model_can_be_opened_from_a_cyrillic_project_directory(self):
+        import shutil
+        import screen_ocr
+        with TemporaryDirectory() as folder:
+            target = Path(folder)/'шахматы'
+            target.mkdir()
+            shutil.copy2(Path(screen_ocr.DATA_DIR)/'eng.traineddata',target/'eng.traineddata')
+            with patch.object(screen_ocr,'DATA_DIR',target):
+                with screen_ocr.PyTessBaseAPI(path=screen_ocr.tessdata_path(),lang='eng') as api:
+                    api.SetImage(Image.new('L',(80,40),255))
+                    self.assertEqual(api.GetUTF8Text().strip(),'')
+
     def test_one_button_finds_board_relocates_and_stops(self):
         import tkinter as tk
         import trainer

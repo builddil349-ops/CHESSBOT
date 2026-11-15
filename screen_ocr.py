@@ -4,6 +4,8 @@ from statistics import median
 import csv
 import io
 import re
+import os
+import ctypes
 import numpy as np
 
 from PIL import ImageOps
@@ -13,6 +15,21 @@ from move_list import read_token
 
 DATA_DIR = Path(__file__).resolve().parent
 MOVE_ALPHABET = "abcdefgh12345678xKQRBNO0=-"
+
+
+def tessdata_path():
+    path = str(DATA_DIR)
+    if os.name == 'nt' and not path.isascii():
+        # Tesseract's native Windows file API may not accept a UTF-8 pathname.
+        # Its DOS alias identifies the same directory without copying the model.
+        kernel32 = ctypes.WinDLL('kernel32',use_last_error=True)
+        kernel32.GetShortPathNameW.argtypes = (ctypes.c_wchar_p,ctypes.c_wchar_p,ctypes.c_uint32)
+        kernel32.GetShortPathNameW.restype = ctypes.c_uint32
+        short = ctypes.create_unicode_buffer(32768)
+        length = kernel32.GetShortPathNameW(path,short,len(short))
+        if 0 < length < len(short):
+            return short.value
+    return path
 
 
 def move_list_from_words(words, board_box, image_size):
@@ -80,7 +97,7 @@ def locate_move_list(image, board_box, clip=None):
                 words.append((text, round(int(row['left'])/2)+origin[0],
                               round(int(row['top'])/2)+origin[1],
                               round(int(row['width'])/2),round(int(row['height'])/2)))
-    with PyTessBaseAPI(path=str(DATA_DIR), lang='eng', psm=PSM.SPARSE_TEXT) as api:
+    with PyTessBaseAPI(path=tessdata_path(), lang='eng', psm=PSM.SPARSE_TEXT) as api:
         api.SetImage(prepared)
         read_words(api.GetTSVText(0),area)
         # Sparse-page OCR discards isolated small move numbers. Find their
@@ -145,7 +162,7 @@ def scan_move_list(image):
     rows = [(top, bottom) for top, bottom in ink_runs(number_mask.getprojection()[1])
             if 7 <= bottom-top <= 36]
     tokens = {}
-    with PyTessBaseAPI(path=str(DATA_DIR), lang="eng", psm=PSM.SINGLE_LINE) as api:
+    with PyTessBaseAPI(path=tessdata_path(), lang="eng", psm=PSM.SINGLE_LINE) as api:
         if not rows:
             return tokens
         gaps = [b[0]-a[0] for a,b in zip(rows, rows[1:])]
